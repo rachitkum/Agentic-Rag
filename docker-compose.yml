@@ -1,0 +1,25 @@
+# Weaviate for the RAG agent. We supply our own vectors (local MiniLM embeddings),
+# so no vectorizer module is enabled.
+#
+#   docker compose up -d
+#
+# Then point the app at it:  WEAVIATE_URL=http://localhost:8080
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
+    ports:
+      - "8080:8080"     # REST
+      - "50051:50051"   # gRPC (used by weaviate-client v4)
+    restart: on-failure:0
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: "node1"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+
+volumes:
+  weaviate_data:
