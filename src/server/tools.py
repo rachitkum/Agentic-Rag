@@ -17,17 +17,17 @@ def web_search(query: str) -> str:
         return "Web search failed."
 
 
-def build_tools(session_id: str = ""):
-    """Return the tool set for a voice connection, with KB search bound to session_id."""
+def build_tools(user_id: str = "", tenant_id: str = ""):
+    """Return the tool set for a voice connection, with KB search bound to the caller."""
 
     def knowledge_base_search(query: str, mode: str = "specific") -> str:
-        """Collapsed-tree search over the RAPTOR knowledge base for this session.
+        """Collapsed-tree search over the RAPTOR knowledge base for this user.
 
         mode='broad' for summary/overview questions (covers all themes via summary nodes),
         mode='specific' for targeted questions (leaf-level detail).
         """
         try:
-            text, links = kb.fetchContextDB(query, session_id, mode=mode)
+            text, links = kb.fetchContextDB(query, user_id, tenant_id, mode=mode)
             return text or "No relevant context found in the uploaded documents."
         except Exception as e:
             print("ERROR in knowledge_base_search tool:", e)
@@ -68,7 +68,3 @@ def _tool_specs(knowledge_base_search):
             "func": web_search,
         },
     ]
-
-
-# Default (session-less) tools, e.g. for a voice call with no uploaded documents.
-TOOLS = build_tools("")

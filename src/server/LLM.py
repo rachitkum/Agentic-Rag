@@ -112,13 +112,13 @@ class ChatOpenAI:
     #    to REPLACE them. Keep the strong chunks we already have. Max MAX_RETRIEVAL_ITERS.
     # 5. Merge all strong chunks collected across iterations and generate ONCE
     #    (no parallel/partial answer -> no contradiction/flip-flop to reconcile).
-    def _agenticRetrieveDocs(self, kb, query, mode, session_id):
+    def _agenticRetrieveDocs(self, kb, query, mode, user_id, tenant_id):
         collected_strong = []       # accumulates strong chunks across iterations
         seen_text = set()
         best_links = []
 
         for i in range(self.MAX_RETRIEVAL_ITERS):
-            scored = kb.fetchScoredContext(query, session_id, mode=mode)
+            scored = kb.fetchScoredContext(query, user_id, tenant_id, mode=mode)
 
             for c in scored["strong"]:
                 if c["text"] not in seen_text:
@@ -145,7 +145,7 @@ class ChatOpenAI:
         # Merge strong chunks; if we never found any strong ones, fall back to the
         # best-scored chunks we did see so we still attempt an answer.
         if not collected_strong:
-            fallback = kb.fetchScoredContext(query, session_id, mode=mode)["all"][:3]
+            fallback = kb.fetchScoredContext(query, user_id, tenant_id, mode=mode)["all"][:3]
             collected_strong = fallback
             best_links = [c["link"] for c in fallback if c.get("link")]
 
@@ -153,10 +153,10 @@ class ChatOpenAI:
         return merged_text, [], best_links
 
     # Web retrieval keeps the single-blob Tavily path (not chunk-scored), still bounded.
-    def _agenticRetrieveWeb(self, kb, query, mode, session_id):
+    def _agenticRetrieveWeb(self, kb, query, mode, user_id, tenant_id):
         best_context, best_imgs, best_links = "", [], []
         for i in range(self.MAX_RETRIEVAL_ITERS):
-            context, imgs, links = kb.fetchContext(query, "web search", session_id=session_id, mode=mode)
+            context, imgs, links = kb.fetchContext(query, "web search", user_id=user_id, tenant_id=tenant_id, mode=mode)
             if len(context) > len(best_context):
                 best_context, best_imgs, best_links = context, imgs, links
             if i == self.MAX_RETRIEVAL_ITERS - 1:
@@ -175,7 +175,7 @@ class ChatOpenAI:
     # use the rewritten standalone_query, which is what makes follow-ups ("what about
     # its risks?") work end to end. For retrieval routes the agent self-decides whether
     # it has enough context and loops if not (_agenticRetrieve).
-    def simpleResponseWithToolCall(self, msg, kb, activeButton, query, history, session_id=""):
+    def simpleResponseWithToolCall(self, msg, kb, activeButton, query, history, user_id="", tenant_id=""):
         sysMsg = msg[0]  # system message assembled by the caller
 
         decision = router.route(
@@ -198,11 +198,11 @@ class ChatOpenAI:
         # chunks; web uses the bounded blob loop.
         if decision.route == "web":
             context, imgs, relevant_link = self._agenticRetrieveWeb(
-                kb, decision.standalone_query, decision.mode, session_id
+                kb, decision.standalone_query, decision.mode, user_id, tenant_id
             )
         else:
             context, imgs, relevant_link = self._agenticRetrieveDocs(
-                kb, decision.standalone_query, decision.mode, session_id
+                kb, decision.standalone_query, decision.mode, user_id, tenant_id
             )
 
         answer = self._groundedAnswer(sysMsg, history, decision.standalone_query, context)

@@ -15,6 +15,7 @@ from src.server.prompt import INSTRUCTIONS
 from src.server.tools import build_tools
 from src.server.voice import OpenAIVoiceReactAgent
 from src.server.ingest import ingest_pdf
+from src.db import auth, postgres, vectorstore
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are rag-agent, a helpful study and research assistant. "
@@ -32,23 +33,31 @@ async def handleUpload(request: Request):
     try:
         form = await request.form()
         upload = form.get("file")
-        session_id = form.get("session_id")
+        user_id = form.get("user_id")
+        session_id = form.get("session_id") or ""
 
         if upload is None:
             return JSONResponse({"err": "No file provided"}, status_code=400)
-        if not session_id:
-            return JSONResponse({"err": "session_id is required"}, status_code=400)
+        if not user_id:
+            return JSONResponse({"err": "user_id is required"}, status_code=400)
+
+        tenant_id = await asyncio.to_thread(auth.resolveTenant, user_id)
+        if tenant_id is None:
+            return JSONResponse({"err": "Unknown user_id"}, status_code=404)
 
         pdf_bytes = await upload.read()
         file_name = getattr(upload, "filename", "") or "document.pdf"
 
+        doc_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
         UPLOAD_JOBS[job_id] = {"status": "processing"}
 
         async def run_job():
             try:
                 # Tree-building calls the LLM per cluster; keep it off the event loop.
-                result = await asyncio.to_thread(ingest_pdf, pdf_bytes, session_id, file_name)
+                result = await asyncio.to_thread(
+                    ingest_pdf, pdf_bytes, user_id, tenant_id, doc_id, session_id, file_name
+                )
                 UPLOAD_JOBS[job_id] = {"status": "done", "result": result}
             except Exception as e:
                 print("ERROR during ingestion job:", e)
@@ -56,7 +65,7 @@ async def handleUpload(request: Request):
 
         asyncio.create_task(run_job())
 
-        return JSONResponse({"job_id": job_id, "status": "processing"})
+        return JSONResponse({"job_id": job_id, "doc_id": doc_id, "status": "processing"})
     except Exception as e:
         print("ERROR occurred while handling upload ", e)
         return JSONResponse({"err": "Internal server error"}, status_code=500)
@@ -78,7 +87,13 @@ async def handleChat(request: Request):
     try:
         userMsg = await request.json()
 
-        session_id = userMsg.get("session_id", "")
+        user_id = userMsg.get("user_id", "")
+        if not user_id:
+            return JSONResponse({"err": "user_id is required"}, status_code=400)
+
+        tenant_id = await asyncio.to_thread(auth.resolveTenant, user_id)
+        if tenant_id is None:
+            return JSONResponse({"err": "Unknown user_id"}, status_code=404)
 
         kb = KnowledgeBase()
 
@@ -129,7 +144,8 @@ async def handleChat(request: Request):
             activeButton=userMsg.get("activeButton", "document"),
             query=routingCurrMsg,
             history=shortHistory,
-            session_id=session_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
         )
 
         assistant = {
@@ -150,25 +166,47 @@ async def handleChat(request: Request):
 
 
 # Realtime speech-to-speech call backed by the RAG tools.
-# session_id comes in as a query param (ws://.../call?session_id=...) so the voice
-# knowledge_base_search is scoped to the documents that session uploaded.
+# user_id comes in as a query param (ws://.../call?user_id=...) so the voice
+# knowledge_base_search is scoped to that user's documents.
 async def handleCall(websocket: WebSocket):
     await websocket.accept()
 
-    session_id = websocket.query_params.get("session_id", "")
+    user_id = websocket.query_params.get("user_id", "")
+    tenant_id = await asyncio.to_thread(auth.resolveTenant, user_id) if user_id else None
+    if tenant_id is None:
+        await websocket.close(code=4004)
+        return
 
     browser_receive_stream = websocket_stream(websocket)
 
     agent = OpenAIVoiceReactAgent(
         model="gpt-4o-realtime-preview",
-        tools=build_tools(session_id),
+        tools=build_tools(user_id, tenant_id),
         instructions=INSTRUCTIONS,
     )
 
     await agent.aconnect(browser_receive_stream, websocket.send_text)
 
-async def createuser(user_id):
-    pass
+# Create-or-login. - not added password auth for now 
+async def createuser(request: Request):
+    try:
+        body = await request.json()
+        user_id = (body.get("user_id") or "").strip()
+
+        if not user_id:
+            return JSONResponse({"err": "user_id is required"}, status_code=400)
+
+        user = await asyncio.to_thread(auth.createOrLoginUser, user_id)
+
+        return JSONResponse({
+            "user_id": user["user_id"],
+            "tenant_id": user["tenant_id"],
+            "created": user["created"],
+        }, status_code=201 if user["created"] else 200)
+    except Exception as e:
+        print("ERROR occurred while creating user ", e)
+        return JSONResponse({"err": "Internal server error"}, status_code=500)
+
 
 routes = [
     Route("/user",createuser,methods=["POST"]),
@@ -178,7 +216,17 @@ routes = [
     WebSocketRoute("/call", handleCall),
 ]
 
-app = Starlette(debug=True, routes=routes)
+async def on_startup():
+    """Create the partitioned tables if they don't exist yet."""
+    await asyncio.to_thread(postgres.initSchema)
+
+
+async def on_shutdown():
+    await asyncio.to_thread(vectorstore.close_client)
+
+
+app = Starlette(debug=True, routes=routes,
+                on_startup=[on_startup], on_shutdown=[on_shutdown])
 
 # Add CORS middleware
 app.add_middleware(

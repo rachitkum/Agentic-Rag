@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 import os
 
 from src.server.utils import getEmbeddings, re_rank_cross_encoders, rerank_scored
-from src.server import vectorstore
+from src.db import vectorstore
 
 # Load environment variables from the .env file (if present)
 load_dotenv()
@@ -24,18 +24,15 @@ class KnowledgeBase:
 
     # Shared: run the Weaviate vector search for a query and return unique candidate
     # chunks with their source metadata (pre-rerank).
-    def _retrieveCandidates(self, query, session_id, nResults, mode):
+    def _retrieveCandidates(self, query, user_id, tenant_id, nResults, mode):
         client = vectorstore.get_client()
-        try:
-            query_vector = getEmbeddings(query).tolist()
-            if mode == "broad":
-                summary_hits = vectorstore.search(client, query_vector, session_id, nResults, node_type="summary")
-                leaf_hits = vectorstore.search(client, query_vector, session_id, nResults, node_type="leaf")
-                results = summary_hits + leaf_hits
-            else:
-                results = vectorstore.search(client, query_vector, session_id, nResults)
-        finally:
-            client.close()
+        query_vector = getEmbeddings(query).tolist()
+        if mode == "broad":
+            summary_hits = vectorstore.search(client, query_vector, tenant_id, user_id, nResults, node_type="summary")
+            leaf_hits = vectorstore.search(client, query_vector, tenant_id, user_id, nResults, node_type="leaf")
+            results = summary_hits + leaf_hits
+        else:
+            results = vectorstore.search(client, query_vector, tenant_id, user_id, nResults)
 
         texts, links, seen = [], [], set()
         for s in results:
@@ -56,9 +53,9 @@ class KnowledgeBase:
     # strong chunks and re-retrieve to replace weak ones.
     #
     # Returns: {"strong": [{text, score, link}], "weak": [...], "all": [...]}
-    def fetchScoredContext(self, query, session_id, nResults: int = 50, mode: str = "specific"):
+    def fetchScoredContext(self, query, user_id, tenant_id, nResults: int = 50, mode: str = "specific"):
         try:
-            texts, links = self._retrieveCandidates(query, session_id, nResults, mode)
+            texts, links = self._retrieveCandidates(query, user_id, tenant_id, nResults, mode)
             top_k = 8 if mode == "broad" else 5
             scored = rerank_scored(query, texts, links, top_k=top_k)
             strong = [c for c in scored if c["score"] >= STRONG_THRESHOLD]
@@ -69,15 +66,14 @@ class KnowledgeBase:
             print("ERROR ocurred while scoring context :", e)
             return {"strong": [], "weak": [], "all": []}
 
-    # RAG retrieval from Weaviate (session-scoped) + cross-encoder re-ranking.
+    # RAG retrieval from Weaviate (tenant + user scoped) + cross-encoder re-ranking.
     #
     # mode="specific"  -> normal top-k over all nodes; detail questions land on leaves.
     # mode="broad"     -> summary/overview questions; we deliberately pull SUMMARY nodes
     #                     first so retrieval covers every theme in the document instead
     #                     of over-sampling one, then backfill with leaves. This is what
     #                     stops "summarize the whole document" from missing sections.
-    def fetchContextDB(self, query, session_id, nResults: int = 50, mode: str = "specific"):
-        client = None
+    def fetchContextDB(self, query, user_id, tenant_id, nResults: int = 50, mode: str = "specific"):
         try:
             embedd = getEmbeddings(query)
             query_vector = embedd.tolist()
@@ -86,15 +82,15 @@ class KnowledgeBase:
 
             if mode == "broad":
                 # Summary nodes first (theme coverage) + leaves for grounding.
-                summary_hits = vectorstore.search(client, query_vector, session_id, nResults, node_type="summary")
-                leaf_hits = vectorstore.search(client, query_vector, session_id, nResults, node_type="leaf")
+                summary_hits = vectorstore.search(client, query_vector, tenant_id, user_id, nResults, node_type="summary")
+                leaf_hits = vectorstore.search(client, query_vector, tenant_id, user_id, nResults, node_type="leaf")
                 results = summary_hits + leaf_hits
                 top_k = 8  # broad answers need more context blocks for full coverage
             else:
-                results = vectorstore.search(client, query_vector, session_id, nResults)
+                results = vectorstore.search(client, query_vector, tenant_id, user_id, nResults)
                 top_k = 3
 
-            print(f"weaviate fetched (mode={mode}, session={session_id}) -> {len(results)}")
+            print(f"weaviate fetched (mode={mode}, tenant={tenant_id}, user={user_id}) -> {len(results)}")
 
             strResult = []
             linkResult = []
@@ -118,9 +114,6 @@ class KnowledgeBase:
         except Exception as e:
             print("ERROR ocurred while fetching context :", e)
             return "", []
-        finally:
-            if client is not None:
-                client.close()
 
     # Real-time web retrieval via tavily + page scrape
     def fetchContextWeb(self, query_text):
@@ -156,17 +149,17 @@ class KnowledgeBase:
             print("ERROR ocurred while fetching context from web :", e)
             return "", [], []
 
-    # Fetch context from either the uploaded documents (session KB) or the web.
+    # Fetch context from either the uploaded documents (user KB) or the web.
     # mode ("specific"|"broad") controls collapsed-tree retrieval for the KB path.
-    def fetchContext(self, query, activeButton, session_id="", mode="specific"):
+    def fetchContext(self, query, activeButton, user_id="", tenant_id="", mode="specific"):
         print("calling fetch context: ", activeButton, "mode:", mode)
         try:
             if activeButton == "web search":  # Web search
                 relevant_text, relevant_img, revelant_link = self.fetchContextWeb(query)
                 return relevant_text, relevant_img, revelant_link
 
-            else:  # Uploaded-document (session) knowledge base
-                relevant_text, relevant_link = self.fetchContextDB(query, session_id, mode=mode)
+            else:  # Uploaded-document knowledge base
+                relevant_text, relevant_link = self.fetchContextDB(query, user_id, tenant_id, mode=mode)
                 return relevant_text, [], relevant_link
 
         except Exception as e:
