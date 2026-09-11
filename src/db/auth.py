@@ -1,11 +1,8 @@
 """
 User identity and tenant resolution.
 
-No password: POST /user is both signup and login. A known user_id returns the existing
-row and its existing tenant; an unknown one is created and assigned a bucket.
-
-resolveTenant() sits on every read and write path, so it is cached in-process. A user's
-tenant only changes during a promotion, which is rare and offline.
+No password: POST /user is both signup and login. resolveTenant() sits on every read
+and write path, so it is cached in-process.
 """
 
 from src.db import postgres, tenancy

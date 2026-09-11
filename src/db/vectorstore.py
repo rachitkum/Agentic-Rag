@@ -1,13 +1,11 @@
 """
 Weaviate vector store for the RAG agent.
 
-We supply our own vectors (local MiniLM embeddings), so the Weaviate collection is
-created with vectorizer = none. Every RAPTOR node (leaf chunk or cluster summary)
-is one object.
+We supply our own vectors (local MiniLM embeddings), so the collection is created with
+vectorizer = none. Every RAPTOR node (leaf chunk or cluster summary) is one object.
 
-The collection is multi-tenant: a tenant is a bucket of users (src/db/tenancy.py), so
-a search enters only that bucket's own vector index instead of filtering the whole
-corpus. Within a bucket, `user_id` scopes results to one user's documents.
+The collection is multi-tenant: a tenant is a bucket of users (src/db/tenancy.py), so a
+search enters only that bucket's index. Within it, `user_id` scopes to one user.
 
 Run Weaviate on Docker; connect via env:
     WEAVIATE_URL       (e.g. http://localhost:8080)
@@ -101,9 +99,7 @@ def _tenant(client, tenant_id: str):
 
 def insert_nodes(client, nodes: list[dict], tenant_id: str, user_id: str,
                  doc_id: str, session_id: str = "") -> int:
-    """Batch-insert one document's RAPTOR nodes into its owner's tenant. Each node dict
-    has text, embedding, node_type, level, source, file_name (embedding becomes the
-    vector)."""
+    """Batch-insert one document's RAPTOR nodes into its owner's tenant."""
     collection = _tenant(client, tenant_id)
     with collection.batch.dynamic() as batch:
         for node in nodes:
@@ -126,8 +122,7 @@ def insert_nodes(client, nodes: list[dict], tenant_id: str, user_id: str,
 
 def search(client, query_vector, tenant_id: str, user_id: str, limit: int = 50,
            node_type: str = None) -> list[dict]:
-    """Vector search inside one tenant, scoped to a single user, optionally restricted
-    to leaf/summary nodes."""
+    """Vector search in one tenant, scoped to one user, optionally by node type."""
     collection = _tenant(client, tenant_id)
 
     filters = Filter.by_property("user_id").equal(user_id)

@@ -1,27 +1,17 @@
-"""
-Short-term conversation memory in Valkey.
-
-One list per (user_id, session_id) holding the recent turns of that chat. The client
-no longer sends history: it sends user_id + session_id, and the server reads the last
-TURN_WINDOW turns, then appends the new user message and the assistant reply.
-
-Keys expire after TTL_SECONDS so abandoned chats clean themselves up.
-
-Env:
-    VALKEY_URL   (e.g. redis://localhost:6379/0)
-"""
-
+# short- term memory last 6 convos for llm context of chat
 import json
 import os
 
 from dotenv import load_dotenv
 import valkey
 
+from src.db import postgres
+
 load_dotenv()
 
 VALKEY_URL = os.getenv("VALKEY_URL", "redis://localhost:6379/0")
 
-# Turns kept in the prompt. The list is trimmed to this on every append.
+# Turns kept in the prompt; the list is trimmed to this on append.
 TURN_WINDOW = 6
 TTL_SECONDS = 60 * 60 * 24 * 7
 
@@ -48,21 +38,52 @@ def _key(user_id: str, session_id: str) -> str:
 
 
 def getHistory(user_id: str, session_id: str, limit: int = TURN_WINDOW) -> list[dict]:
-    """Last `limit` turns, oldest first. Empty list for a new or expired session."""
+    """Last `limit` turns, oldest first. Falls back to Postgres and warms the cache."""
     if not user_id or not session_id:
         return []
+
     try:
         raw = get_client().lrange(_key(user_id, session_id), -limit, -1)
-        return [json.loads(t) for t in raw]
+        if raw:
+            return [json.loads(t) for t in raw]
     except Exception as e:
-        print("ERROR reading chat history:", e)
+        print("ERROR reading chat history from cache:", e)
+
+    # Miss: new session, evicted, expired, or restarted.
+    try:
+        turns = postgres.getRecentMessages(user_id, session_id, limit)
+    except Exception as e:
+        print("ERROR reading chat history from postgres:", e)
         return []
+
+    if turns:
+        _warm(user_id, session_id, turns)
+    return turns
+
+
+def _warm(user_id: str, session_id: str, turns: list[dict]) -> None:
+    """Repopulate the cache from the durable log."""
+    try:
+        key = _key(user_id, session_id)
+        pipe = get_client().pipeline()
+        pipe.delete(key)
+        pipe.rpush(key, *[json.dumps(t) for t in turns])
+        pipe.expire(key, TTL_SECONDS)
+        pipe.execute()
+    except Exception as e:
+        print("ERROR warming chat history:", e)
 
 
 def appendTurns(user_id: str, session_id: str, turns: list[dict]) -> None:
-    """Append turns, trim to the window, and refresh the TTL."""
+    """Postgres first, then cache: a lost cache entry is recoverable, a lost write isn't."""
     if not user_id or not session_id or not turns:
         return
+
+    try:
+        postgres.appendMessages(user_id, session_id, turns)
+    except Exception as e:
+        print("ERROR writing chat history to postgres:", e)
+
     try:
         key = _key(user_id, session_id)
         pipe = get_client().pipeline()
@@ -71,4 +92,4 @@ def appendTurns(user_id: str, session_id: str, turns: list[dict]) -> None:
         pipe.expire(key, TTL_SECONDS)
         pipe.execute()
     except Exception as e:
-        print("ERROR writing chat history:", e)
+        print("ERROR writing chat history to cache:", e)

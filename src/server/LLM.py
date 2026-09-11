@@ -6,7 +6,6 @@ import os
 
 from src.server import router
 
-# Load environment variables from the .env file (if present)
 load_dotenv()
 
 AZURE_API_KEY = os.getenv('AZURE_API_KEY')
@@ -33,11 +32,10 @@ class ChatOpenAI:
         self.model = model
 
     async def simpleResponse(self, msg):
-        # Message contains system msg, chat history and user current query
         completion = self.client.chat.completions.create(model=self.model, messages=msg, max_tokens=5000, temperature=0.1)
         return completion.choices[0].message
 
-    # Summarize a cluster of chunks into one node (used when building the RAPTOR tree)
+    # One node from a cluster of chunks, used when building the RAPTOR tree.
     def summarizeCluster(self, texts: list) -> str:
         joined = "\n\n---\n\n".join(texts)
         messages = [
@@ -52,7 +50,7 @@ class ChatOpenAI:
         )
         return completion.choices[0].message.content
 
-    # Max retrieve -> grade -> reformulate cycles before we answer with what we have.
+    # Max retrieve -> grade -> reformulate cycles before answering with what we have.
     MAX_RETRIEVAL_ITERS = 2
 
     # Casual / small-talk reply.
@@ -84,8 +82,7 @@ class ChatOpenAI:
         )
         return completion.choices[0].message
 
-    # Grounded, structured answer. Uses the rewritten standalone query (not the raw
-    # pronoun message) so generation and retrieval stay consistent on follow-ups.
+    # Uses the rewritten standalone query so generation and retrieval stay consistent.
     def _groundedAnswer(self, sysMsg, history, standalone_query, context):
         msg = [sysMsg] + history + [{
             "role": "user",
@@ -100,18 +97,11 @@ class ChatOpenAI:
         )
         return completion.choices[0].message
 
-    # How many strong (high-confidence) chunks we consider "enough" to answer well.
+    # Strong chunks considered "enough" to answer.
     ENOUGH_STRONG_CHUNKS = 3
 
-    # Confidence-based agentic retrieval over the uploaded documents.
-    #
-    # 1. Retrieve + score each chunk with the cross-encoder.
-    # 2. Split strong vs. weak by KB.STRONG_THRESHOLD.
-    # 3. If enough strong chunks -> stop, answer from them (fast path).
-    # 4. Else -> the WEAK chunks failed; reformulate a sharper query and re-retrieve
-    #    to REPLACE them. Keep the strong chunks we already have. Max MAX_RETRIEVAL_ITERS.
-    # 5. Merge all strong chunks collected across iterations and generate ONCE
-    #    (no parallel/partial answer -> no contradiction/flip-flop to reconcile).
+    # Retrieve -> score -> if not enough strong chunks, reformulate and retry to
+    # replace the weak ones. Merge across iterations and generate once.
     def _agenticRetrieveDocs(self, kb, query, mode, user_id, tenant_id):
         collected_strong = []       # accumulates strong chunks across iterations
         seen_text = set()
@@ -127,23 +117,21 @@ class ChatOpenAI:
                     if c.get("link"):
                         best_links.append(c["link"])
 
-            # Enough high-confidence context, or last allowed pass -> stop.
+            # Enough context, or last allowed pass.
             if len(collected_strong) >= self.ENOUGH_STRONG_CHUNKS:
                 print(f"AGENT: enough strong chunks ({len(collected_strong)}) after iter {i + 1}")
                 break
             if i == self.MAX_RETRIEVAL_ITERS - 1:
                 break
 
-            # Weak chunks dominated -> reformulate around what's still missing and
-            # escalate breadth, then retry to replace them.
+            # Weak chunks dominated -> reformulate and escalate breadth.
             weak_preview = " | ".join(c["text"][:200] for c in scored["weak"][:3])
             grade = router.grade_context(self.client, self.model, query, weak_preview)
             print(f"AGENT: only {len(collected_strong)} strong after iter {i + 1}, re-retrieving")
             query = grade.next_query or query
             mode = grade.escalate_mode
 
-        # Merge strong chunks; if we never found any strong ones, fall back to the
-        # best-scored chunks we did see so we still attempt an answer.
+        # No strong chunks at all -> fall back to the best we saw.
         if not collected_strong:
             fallback = kb.fetchScoredContext(query, user_id, tenant_id, mode=mode)["all"][:3]
             collected_strong = fallback
@@ -152,7 +140,7 @@ class ChatOpenAI:
         merged_text = "\n\n".join(c["text"] for c in collected_strong)
         return merged_text, [], best_links
 
-    # Web retrieval keeps the single-blob Tavily path (not chunk-scored), still bounded.
+    # Single-blob Tavily path, not chunk-scored, still bounded.
     def _agenticRetrieveWeb(self, kb, query, mode, user_id, tenant_id):
         best_context, best_imgs, best_links = "", [], []
         for i in range(self.MAX_RETRIEVAL_ITERS):
@@ -168,13 +156,8 @@ class ChatOpenAI:
             mode = grade.escalate_mode
         return best_context, best_imgs, best_links
 
-    # RAG chat entrypoint.
-    #
-    # ROUTE (rewrite the message into a standalone query using history + pick
-    # route/mode) -> handle chat / reformat / retrieval. Retrieval AND generation both
-    # use the rewritten standalone_query, which is what makes follow-ups ("what about
-    # its risks?") work end to end. For retrieval routes the agent self-decides whether
-    # it has enough context and loops if not (_agenticRetrieve).
+    # Route (rewrite into a standalone query + pick route/mode) -> chat / reformat /
+    # retrieval. The rewritten query is what makes follow-ups work end to end.
     def simpleResponseWithToolCall(self, msg, kb, activeButton, query, history, user_id="", tenant_id=""):
         sysMsg = msg[0]  # system message assembled by the caller
 
@@ -194,8 +177,7 @@ class ChatOpenAI:
         if decision.route == "reformat":
             return self._reformatReply(decision.standalone_query, history), [], []
 
-        # Retrieval route. Docs uses confidence-based scoring + re-retrieval of weak
-        # chunks; web uses the bounded blob loop.
+        # Docs uses confidence scoring + re-retrieval; web uses the bounded blob loop.
         if decision.route == "web":
             context, imgs, relevant_link = self._agenticRetrieveWeb(
                 kb, decision.standalone_query, decision.mode, user_id, tenant_id

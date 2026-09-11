@@ -12,9 +12,7 @@ load_dotenv()
 
 TAVILY_CLIENT = TavilyClient(api_key=os.getenv('TAVILY_KEY'))
 
-# Cross-encoder confidence bands for the agentic RAG loop.
-# rerank keeps chunks with score > 0.4; among those we call a chunk "strong" if it
-# clears STRONG_THRESHOLD. Weak chunks (0.4..strong) are what trigger re-retrieval.
+# Chunks scoring below this are "weak" and trigger re-retrieval.
 STRONG_THRESHOLD = 0.6
 
 
@@ -22,8 +20,7 @@ class KnowledgeBase:
     def __init__(self) -> None:
         self.tavily = TAVILY_CLIENT
 
-    # Shared: run the Weaviate vector search for a query and return unique candidate
-    # chunks with their source metadata (pre-rerank).
+    # Vector search -> unique candidate chunks with source metadata (pre-rerank).
     def _retrieveCandidates(self, query, user_id, tenant_id, nResults, mode):
         client = vectorstore.get_client()
         query_vector = getEmbeddings(query).tolist()
@@ -48,11 +45,8 @@ class KnowledgeBase:
             })
         return texts, links
 
-    # Confidence-scored retrieval for the agentic RAG loop. Returns per-chunk records
-    # split into strong/weak by the cross-encoder score, so the caller can answer from
-    # strong chunks and re-retrieve to replace weak ones.
-    #
-    # Returns: {"strong": [{text, score, link}], "weak": [...], "all": [...]}
+    # Returns {"strong": [{text, score, link}], "weak": [...], "all": [...]} so the
+    # caller can answer from strong chunks and re-retrieve to replace weak ones.
     def fetchScoredContext(self, query, user_id, tenant_id, nResults: int = 50, mode: str = "specific"):
         try:
             texts, links = self._retrieveCandidates(query, user_id, tenant_id, nResults, mode)
@@ -66,13 +60,8 @@ class KnowledgeBase:
             print("ERROR ocurred while scoring context :", e)
             return {"strong": [], "weak": [], "all": []}
 
-    # RAG retrieval from Weaviate (tenant + user scoped) + cross-encoder re-ranking.
-    #
-    # mode="specific"  -> normal top-k over all nodes; detail questions land on leaves.
-    # mode="broad"     -> summary/overview questions; we deliberately pull SUMMARY nodes
-    #                     first so retrieval covers every theme in the document instead
-    #                     of over-sampling one, then backfill with leaves. This is what
-    #                     stops "summarize the whole document" from missing sections.
+    # mode="specific" -> top-k over all nodes; detail questions land on leaves.
+    # mode="broad"    -> summary nodes first so every theme is covered, then leaves.
     def fetchContextDB(self, query, user_id, tenant_id, nResults: int = 50, mode: str = "specific"):
         try:
             embedd = getEmbeddings(query)
@@ -149,8 +138,7 @@ class KnowledgeBase:
             print("ERROR ocurred while fetching context from web :", e)
             return "", [], []
 
-    # Fetch context from either the uploaded documents (user KB) or the web.
-    # mode ("specific"|"broad") controls collapsed-tree retrieval for the KB path.
+    # Uploaded documents or the web, depending on activeButton.
     def fetchContext(self, query, activeButton, user_id="", tenant_id="", mode="specific"):
         print("calling fetch context: ", activeButton, "mode:", mode)
         try:

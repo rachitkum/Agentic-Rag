@@ -1,11 +1,9 @@
 """
 Tenant assignment.
 
-A tenant is a bucket of users, not a single user. At signup a user is hashed into a
-bucket and that value is stored in Postgres; reads always use the stored value.
-
-The bucket count grows with the user base instead of being fixed up front. Growing it
-never remaps existing users -- only new signups spread across the wider range.
+A tenant is a bucket of users. At signup a user is hashed into a bucket and that value
+is stored in Postgres; reads always use the stored value, so growing the bucket count
+never remaps existing users.
 """
 
 import hashlib

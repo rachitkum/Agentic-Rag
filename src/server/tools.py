@@ -1,6 +1,5 @@
-# RAG tools exposed to the realtime voice agent.
-# Tools are built per-connection so knowledge_base_search is scoped to the caller's
-# chat session (the documents that session uploaded).
+# RAG tools for the realtime voice agent, built per-connection so
+# knowledge_base_search is scoped to the caller.
 from src.server.KB import KnowledgeBase
 
 kb = KnowledgeBase()

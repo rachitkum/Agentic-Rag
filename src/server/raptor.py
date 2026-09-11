@@ -1,12 +1,10 @@
 """
 RAPTOR-style hierarchical clustering for advanced RAG.
 
-Problem it solves: plain top-k retrieval breaks on big documents. A "summarize the
-whole thing" query is not similar to any single chunk, so top-k over-samples one
-theme and silently drops the rest.
-
-Fix: recursively cluster chunks by embedding similarity, LLM-summarize each cluster
-into a higher-level node, cluster those, and repeat. This builds a tree:
+Plain top-k breaks on big documents: a "summarize the whole thing" query matches no
+single chunk, so it over-samples one theme and drops the rest. Fix: recursively
+cluster chunks by embedding similarity, LLM-summarize each cluster into a higher-level
+node, and repeat.
 
         [root summary]            <- broadest
         /     |      \\
@@ -14,19 +12,11 @@ into a higher-level node, cluster those, and repeat. This builds a tree:
     / \\     / \\     / \\
    c   c   c   c   c   c          <- raw leaf chunks (detail)
 
-We store EVERY node (leaves + all summaries) in the same Weaviate collection with a
-`node_type` ("leaf"/"summary") and `level`. Retrieval then does a single vector
-search over the flattened tree ("collapsed tree" retrieval):
+Every node is stored in one Weaviate collection with node_type and level, so a single
+search over the flattened tree serves both question types: specific queries match
+leaves, broad ones match summaries.
 
-  - specific query  -> naturally matches leaf nodes (detail)
-  - broad/summary Q -> naturally matches summary nodes (coverage), because a
-                       summary node's embedding already represents a whole theme
-
-So one index, one query path handles both small and large docs, and both broad and
-specific questions, without missing data.
-
-This module only BUILDS the tree from a list of chunks. Insertion into Weaviate
-lives in ingest.py; runtime retrieval lives in KB.py.
+This module only builds the tree. Insertion lives in ingest.py, retrieval in KB.py.
 """
 
 import numpy as np
@@ -70,19 +60,10 @@ def _cluster(embeddings: np.ndarray) -> list[list[int]]:
 
 
 def build_raptor_tree(chunks: list[str], embed_fn, summarize_fn) -> list[dict]:
-    """
-    Build the hierarchical node list from raw leaf chunks.
+    """Build the node list from raw leaf chunks.
 
-    Args:
-        chunks:       raw text chunks (the leaves).
-        embed_fn:     text -> np.ndarray embedding.
-        summarize_fn: list[str] -> str, LLM summary of a cluster of texts.
-
-    Returns:
-        list of node dicts, each:
-          { "text": str, "embedding": list[float], "node_type": "leaf"|"summary",
-            "level": int }
-        Level 0 = leaves; higher levels = summaries. Ready to store in Weaviate.
+    Returns {"text", "embedding", "node_type", "level"} dicts. Level 0 = leaves,
+    higher levels = summaries.
     """
     nodes: list[dict] = []
 

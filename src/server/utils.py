@@ -7,7 +7,6 @@ import os
 from sentence_transformers import CrossEncoder
 from sentence_transformers import SentenceTransformer
 
-# Load environment variables from the .env file (if present)
 load_dotenv()
 
 TRANSCRIPTION_URL = os.getenv('TRANSCRIPTION_URL')
@@ -27,25 +26,9 @@ def getEmbeddings(query):
 
 
 def re_rank_cross_encoders(prompt: str, documents: list[str], linkResult: list[str], top_k: int = 3) -> tuple[str, list[int], list[str]]:
-    """Re-ranks documents using a cross-encoder model for more accurate relevance scoring.
+    """Re-rank with the MS MARCO cross-encoder, keeping the top_k scoring above 0.4.
 
-    Uses the MS MARCO MiniLM cross-encoder model to re-rank the input documents based on
-    their relevance to the query prompt. Returns the concatenated text of the top_k most
-    relevant documents along with their indices.
-
-    Args:
-        documents: List of document strings to be re-ranked.
-        top_k: How many top documents to keep (broad/summary queries pass a higher value).
-
-    Returns:
-        tuple: A tuple containing:
-            - relevant_text (str): Concatenated text from the top ranked documents
-            - relevant_text_ids (list[int]): List of indices for the top ranked documents
-            - relevant_link (list[str]): Source links for the top ranked documents
-
-    Raises:
-        ValueError: If documents list is empty
-        RuntimeError: If cross-encoder model fails to load or rank documents
+    Returns (concatenated text, their indices, their source links).
     """
     try:
         relevant_text = ""
@@ -69,13 +52,8 @@ def re_rank_cross_encoders(prompt: str, documents: list[str], linkResult: list[s
 
 
 def rerank_scored(prompt: str, documents: list[str], linkResult: list[str], top_k: int = 8) -> list[dict]:
-    """Re-rank and return per-chunk records with their cross-encoder scores.
-
-    Unlike re_rank_cross_encoders (which concatenates and drops scores), this keeps
-    each chunk's score so callers can split strong vs. weak by a confidence threshold.
-
-    Returns a list of {"text": str, "score": float, "link": dict} sorted best-first.
-    """
+    """Like re_rank_cross_encoders but keeps each chunk's score, so callers can split
+    strong vs. weak. Returns {"text", "score", "link"} records, best first."""
     try:
         if not documents:
             return []
@@ -95,14 +73,14 @@ def rerank_scored(prompt: str, documents: list[str], linkResult: list[str], top_
         return []
 
 
-# Real-time calling socket: yields raw text frames from the browser
+# Yields raw text frames from the browser.
 async def websocket_stream(websocket: WebSocket) -> AsyncIterator[str]:
     while True:
         data = await websocket.receive_text()
         yield data
 
 
-# Merge multiple async streams into one stream (used by the realtime voice agent)
+# Merge async streams into one (used by the voice agent).
 async def amerge(**streams: AsyncIterator[T]) -> AsyncIterator[tuple[str, T]]:
     """Merge multiple streams into one stream."""
     nexts: dict[asyncio.Task, str] = {

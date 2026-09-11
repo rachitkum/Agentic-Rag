@@ -22,13 +22,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "Answer using the retrieved context when available and be honest when you don't know."
 )
 
-# In-memory upload job tracking (job_id -> {status, result/error}).
-# Fine for a single-process demo; swap for Redis if you scale out.
+# job_id -> {status, result/error}. Single-process only; move to Valkey to scale out.
 UPLOAD_JOBS: dict[str, dict] = {}
 
 
-# Upload a PDF into a chat session. Chunk + RAPTOR tree build + Weaviate store runs
-# in the background; the client polls /upload/status/{job_id}.
+# Chunk + RAPTOR build + store runs in the background; client polls /upload/status.
 async def handleUpload(request: Request):
     try:
         form = await request.form()
@@ -80,9 +78,8 @@ async def handleUploadStatus(request: Request):
     return JSONResponse(job)
 
 
-# RAG chat endpoint.
-# Request contains: user_id, session_id, user_content, and optional: system_content,
-# activeButton, image, audio. History is read from Valkey, not sent by the client.
+# Requires user_id, session_id, user_content. Optional: system_content, activeButton,
+# image, audio. History comes from Valkey, not the client.
 async def handleChat(request: Request):
     try:
         userMsg = await request.json()
@@ -155,7 +152,7 @@ async def handleChat(request: Request):
         if len(revelant_link) > 0:
             assistant["links"] = revelant_link
 
-        # Store the plain text of both turns; images and links stay out of the prompt.
+        # Text only; images and links stay out of the prompt.
         await asyncio.to_thread(memory.appendTurns, user_id, session_id, [
             {"role": "user", "content": routingCurrMsg},
             {"role": "assistant", "content": gptResponse.content},
@@ -167,9 +164,8 @@ async def handleChat(request: Request):
         return JSONResponse({"err": "Internal server error"})
 
 
-# Realtime speech-to-speech call backed by the RAG tools.
-# user_id comes in as a query param (ws://.../call?user_id=...) so the voice
-# knowledge_base_search is scoped to that user's documents.
+# Realtime speech-to-speech call. user_id is a query param (ws://.../call?user_id=...)
+# so knowledge_base_search is scoped to that user.
 async def handleCall(websocket: WebSocket):
     await websocket.accept()
 
@@ -219,7 +215,7 @@ routes = [
 ]
 
 async def on_startup():
-    """Create the partitioned tables if they don't exist yet."""
+    """Create the partitioned tables and upcoming month partitions if missing."""
     await asyncio.to_thread(postgres.initSchema)
 
 

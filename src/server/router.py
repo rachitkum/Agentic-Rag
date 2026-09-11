@@ -23,8 +23,7 @@ from typing import Literal
 
 # ---- route() output --------------------------------------------------------
 class RouteDecision(BaseModel):
-    # docs = uploaded session KB, web = internet, chat = small talk,
-    # reformat = operate on the PREVIOUS answer (no retrieval needed)
+    # docs = uploaded KB, web = internet, chat = small talk, reformat = previous answer
     route: Literal["docs", "web", "chat", "reformat"]
     standalone_query: str
     mode: Literal["specific", "broad"]
@@ -129,9 +128,8 @@ def route(client, model: str, user_message: str, history: list, active_button: s
         print("ERROR in router, falling back to raw query:", e)
         decision = RouteDecision(route="docs", standalone_query=user_message, mode="specific")
 
-    # Client override: an explicit UI toggle wins over the LLM's source choice,
-    # but keep the rewritten query and mode. Never override chat/reformat (those
-    # need no retrieval, so a source toggle is irrelevant).
+    # An explicit UI toggle wins over the LLM's source choice, but keeps the
+    # rewritten query and mode. Never overrides chat/reformat.
     if decision.route in ("docs", "web"):
         if active_button == _FORCE_WEB:
             decision.route = "web"
@@ -163,7 +161,6 @@ def grade_context(client, model: str, query: str, context: str) -> ContextGrade:
         )
         return completion.choices[0].message.parsed
     except Exception as e:
-        # Fail safe: if grading breaks, treat what we have as sufficient rather than
-        # looping blindly.
+        # Fail safe: treat what we have as sufficient rather than looping blindly.
         print("ERROR in grade_context, treating context as sufficient:", e)
         return ContextGrade(sufficient=True, next_query=query, escalate_mode="specific", switch_source="same")

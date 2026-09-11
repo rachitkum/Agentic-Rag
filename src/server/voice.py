@@ -1,6 +1,5 @@
-# Minimal realtime speech-to-speech agent over the OpenAI Realtime API.
-# Bridges a browser websocket stream with the model websocket and executes
-# RAG tools (see tools.py) when the model requests a function call.
+# Realtime speech-to-speech agent: bridges the browser websocket with the model
+# websocket and runs RAG tools (tools.py) on function calls.
 import json
 import asyncio
 import os
@@ -85,7 +84,7 @@ class OpenAIVoiceReactAgent:
                 try:
                     async for source, raw in amerge(browser=input_stream, model=model_stream()):
                         if source == "browser":
-                            # Forward browser events (audio chunks etc.) straight to the model
+                            # Forward browser events straight to the model.
                             await model_ws.send_str(raw)
                             continue
 
@@ -93,7 +92,7 @@ class OpenAIVoiceReactAgent:
                         event_type = event.get("type", "")
 
                         if event_type == "response.function_call_arguments.done":
-                            # Execute the requested RAG tool and hand the result back
+                            # Run the requested tool and hand the result back.
                             tool_name = event.get("name")
                             call_id = event.get("call_id")
                             print(f"voice agent tool call -> {tool_name}")
@@ -104,7 +103,7 @@ class OpenAIVoiceReactAgent:
                                 try:
                                     args = json.loads(event.get("arguments") or "{}")
                                     query = args.get("query", "")
-                                    # Pass mode through when the tool accepts it (knowledge_base_search)
+                                    # Pass mode through when the tool accepts it.
                                     if "mode" in args:
                                         result = await asyncio.to_thread(func, query, args["mode"])
                                     else:

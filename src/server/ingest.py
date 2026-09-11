@@ -1,15 +1,12 @@
 """
 Document ingestion.
 
-A user uploads a PDF. We chunk it, build a RAPTOR tree (cluster similar chunks ->
-LLM-summarize each cluster -> repeat), and store every node (leaves + summaries) in
-the user's Weaviate tenant. Retrieval (KB.py) then searches leaves and summaries
-together, so "summarize the whole document" lands on high-level summary nodes and a
-specific question lands on leaf chunks — one collection, no missed data — and only
-within the user's own documents.
+Chunk a PDF, build a RAPTOR tree (cluster similar chunks -> LLM-summarize each
+cluster -> repeat), and store every node (leaves + summaries) in the user's Weaviate
+tenant. Retrieval (KB.py) searches leaves and summaries together, so broad questions
+land on summary nodes and specific ones on leaf chunks.
 
-session_id is recorded on each node so an upload can be traced back to the chat it
-came from; it does not scope retrieval.
+session_id is recorded for provenance only; it does not scope retrieval.
 """
 
 import os
