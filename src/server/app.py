@@ -15,7 +15,7 @@ from src.server.prompt import INSTRUCTIONS
 from src.server.tools import build_tools
 from src.server.voice import OpenAIVoiceReactAgent
 from src.server.ingest import ingest_pdf
-from src.db import auth, postgres, vectorstore
+from src.db import auth, memory, postgres, vectorstore
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are rag-agent, a helpful study and research assistant. "
@@ -81,8 +81,8 @@ async def handleUploadStatus(request: Request):
 
 
 # RAG chat endpoint.
-# Request contains: session_id, user_content, and optional: system_content, history,
-# activeButton, image, audio
+# Request contains: user_id, session_id, user_content, and optional: system_content,
+# activeButton, image, audio. History is read from Valkey, not sent by the client.
 async def handleChat(request: Request):
     try:
         userMsg = await request.json()
@@ -95,17 +95,13 @@ async def handleChat(request: Request):
         if tenant_id is None:
             return JSONResponse({"err": "Unknown user_id"}, status_code=404)
 
+        session_id = userMsg.get("session_id", "")
+        if not session_id:
+            return JSONResponse({"err": "session_id is required"}, status_code=400)
+
         kb = KnowledgeBase()
 
-        # Chat history is kept client-side and sent with each request. Sanitize to
-        # just role+content so extra client keys (image, links, ids) don't reach the
-        # OpenAI API and break the completion.
-        raw_history = userMsg.get("history", [])[-6:]
-        history = [
-            {"role": h.get("role", "user"), "content": h.get("content", "")}
-            for h in raw_history
-            if isinstance(h, dict) and h.get("content")
-        ]
+        history = await asyncio.to_thread(memory.getHistory, user_id, session_id)
 
         sysMsg = {
             "role": "system",
@@ -158,6 +154,12 @@ async def handleChat(request: Request):
 
         if len(revelant_link) > 0:
             assistant["links"] = revelant_link
+
+        # Store the plain text of both turns; images and links stay out of the prompt.
+        await asyncio.to_thread(memory.appendTurns, user_id, session_id, [
+            {"role": "user", "content": routingCurrMsg},
+            {"role": "assistant", "content": gptResponse.content},
+        ])
 
         return JSONResponse({"data": [assistant]})
     except Exception as e:
@@ -223,6 +225,7 @@ async def on_startup():
 
 async def on_shutdown():
     await asyncio.to_thread(vectorstore.close_client)
+    await asyncio.to_thread(memory.close_client)
 
 
 app = Starlette(debug=True, routes=routes,

@@ -40,6 +40,21 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  # Short-term chat memory, keyed by (user_id, session_id).
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+    restart: on-failure:0
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - valkey_data:/data
+
 volumes:
   weaviate_data:
   postgres_data:
+  valkey_data:
