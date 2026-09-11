@@ -23,10 +23,10 @@ def bucketCountFor(user_count: int) -> int:
     return max(MIN_BUCKETS, _next_power_of_two(target))
 
 
-def currentBucketCount() -> int:
+async def currentBucketCount() -> int:
     """Bucket count for assigning a new user, from the live user count."""
     from src.db import postgres
-    return bucketCountFor(postgres.getUserCount())
+    return bucketCountFor(await postgres.getUserCount())
 
 
 def _hash(user_id: str) -> int:
@@ -35,10 +35,10 @@ def _hash(user_id: str) -> int:
     return int.from_bytes(digest[:8], "big")
 
 
-def computeBucket(user_id: str, bucket_count: int | None = None) -> str:
+async def computeBucket(user_id: str, bucket_count: int | None = None) -> str:
     """Bucket for a user at signup. Not a lookup -- use auth.resolveTenant() for that."""
     if bucket_count is None:
-        bucket_count = currentBucketCount()
+        bucket_count = await currentBucketCount()
     return f"bucket_{_hash(user_id) % bucket_count:05d}"
 
 

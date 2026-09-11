@@ -37,7 +37,7 @@ def _key(user_id: str, session_id: str) -> str:
     return f"chat:{user_id}:{session_id}"
 
 
-def getHistory(user_id: str, session_id: str, limit: int = TURN_WINDOW) -> list[dict]:
+async def getHistory(user_id: str, session_id: str, limit: int = TURN_WINDOW) -> list[dict]:
     """Last `limit` turns, oldest first. Falls back to Postgres and warms the cache."""
     if not user_id or not session_id:
         return []
@@ -51,7 +51,7 @@ def getHistory(user_id: str, session_id: str, limit: int = TURN_WINDOW) -> list[
 
     # Miss: new session, evicted, expired, or restarted.
     try:
-        turns = postgres.getRecentMessages(user_id, session_id, limit)
+        turns = await postgres.getRecentMessages(user_id, session_id, limit)
     except Exception as e:
         print("ERROR reading chat history from postgres:", e)
         return []
@@ -74,13 +74,13 @@ def _warm(user_id: str, session_id: str, turns: list[dict]) -> None:
         print("ERROR warming chat history:", e)
 
 
-def appendTurns(user_id: str, session_id: str, turns: list[dict]) -> None:
+async def appendTurns(user_id: str, session_id: str, turns: list[dict]) -> None:
     """Postgres first, then cache: a lost cache entry is recoverable, a lost write isn't."""
     if not user_id or not session_id or not turns:
         return
 
     try:
-        postgres.appendMessages(user_id, session_id, turns)
+        await postgres.appendMessages(user_id, session_id, turns)
     except Exception as e:
         print("ERROR writing chat history to postgres:", e)
 

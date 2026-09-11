@@ -11,29 +11,26 @@ _TENANT_CACHE: dict[str, str] = {}
 _CACHE_MAX = 100_000
 
 
-def createOrLoginUser(user_id: str) -> dict:
+async def createOrLoginUser(user_id: str) -> dict:
     """Register a user, or return them if they already exist."""
-    existing = postgres.getUserRow(user_id)
+    existing = await postgres.getUserRow(user_id)
     if existing is not None:
         _TENANT_CACHE[user_id] = existing["tenant_id"]
         return {**existing, "created": False}
 
-    row = postgres.insertUser(user_id, tenancy.computeBucket(user_id))
+    tenant_id = await tenancy.computeBucket(user_id)
+    row = await postgres.insertUser(user_id, tenant_id)
     _TENANT_CACHE[user_id] = row["tenant_id"]
     return {**row, "created": True}
 
 
-def getUser(user_id: str) -> dict | None:
-    return postgres.getUserRow(user_id)
-
-
-def resolveTenant(user_id: str) -> str | None:
+async def resolveTenant(user_id: str) -> str | None:
     """Tenant for a user, or None if unknown. Called on every upload and chat turn."""
     cached = _TENANT_CACHE.get(user_id)
     if cached is not None:
         return cached
 
-    row = postgres.getUserRow(user_id)
+    row = await postgres.getUserRow(user_id)
     if row is None:
         return None
 
@@ -41,8 +38,3 @@ def resolveTenant(user_id: str) -> str | None:
         _TENANT_CACHE.clear()
     _TENANT_CACHE[user_id] = row["tenant_id"]
     return row["tenant_id"]
-
-
-def invalidateTenant(user_id: str) -> None:
-    """Drop a cached mapping. Called after a promotion moves a user."""
-    _TENANT_CACHE.pop(user_id, None)

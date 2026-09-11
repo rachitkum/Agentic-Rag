@@ -13,12 +13,12 @@ Env:
 
 import os
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
 
 load_dotenv()
@@ -30,8 +30,11 @@ PG_PARTITIONS = int(os.getenv("PG_PARTITIONS", "64"))
 
 MONTHS_AHEAD = int(os.getenv("PG_MONTHS_AHEAD", "2"))
 
+# Per process. N replicas x POOL_MAX must stay under the server's max_connections.
+POOL_MAX = int(os.getenv("PG_POOL_MAX", "10"))
+
 # Lazy so importing this module never opens a connection.
-_POOL: ConnectionPool | None = None
+_POOL: AsyncConnectionPool | None = None
 
 # Cached: a full count per signup is too slow.
 _USER_COUNT: int | None = None
@@ -39,22 +42,37 @@ _USER_COUNT_AT: float = 0.0
 _USER_COUNT_TTL = 60.0
 
 
-def get_pool() -> ConnectionPool:
-    """Return the process-wide connection pool, opening it on first use."""
+async def get_pool() -> AsyncConnectionPool:
+    """Return the process-wide connection pool, opening it on first use.
+
+    max_size is per process: with N replicas the cluster holds N x max_size
+    connections, so keep it well under the server's max_connections or front it
+    with PgBouncer.
+    """
     global _POOL
     if _POOL is None:
-        _POOL = ConnectionPool(POSTGRES_URL, min_size=2, max_size=20, open=True)
+        _POOL = AsyncConnectionPool(POSTGRES_URL, min_size=1, max_size=POOL_MAX,
+                                    open=False)
+        await _POOL.open()
     return _POOL
 
 
-@contextmanager
-def get_cursor(commit: bool = False):
+async def close_pool() -> None:
+    global _POOL
+    if _POOL is not None:
+        await _POOL.close()
+        _POOL = None
+
+
+@asynccontextmanager
+async def get_cursor(commit: bool = False):
     """Borrow a connection from the pool and yield a dict-returning cursor."""
-    with get_pool().connection() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
             yield cur
         if commit:
-            conn.commit()
+            await conn.commit()
 
 
 # Partition key must be in every unique constraint, hence created_at in the PK.
@@ -121,27 +139,27 @@ def _month_partition_ddl(months_ahead: int = MONTHS_AHEAD) -> str:
     return "\n".join(stmts)
 
 
-def ensureMonthPartitions(months_ahead: int = MONTHS_AHEAD) -> None:
+async def ensureMonthPartitions(months_ahead: int = MONTHS_AHEAD) -> None:
     """Create upcoming month partitions. Run on boot and from a monthly job."""
-    with get_cursor(commit=True) as cur:
-        cur.execute(_month_partition_ddl(months_ahead))
+    async with get_cursor(commit=True) as cur:
+        await cur.execute(_month_partition_ddl(months_ahead))
 
 
-def initSchema() -> None:
+async def initSchema() -> None:
     """Create the partitioned tables and their partitions. Safe to re-run on boot."""
-    with get_cursor(commit=True) as cur:
-        cur.execute(_PARENT_TABLES)
-        cur.execute(_hash_partition_ddl())
-        cur.execute(_month_partition_ddl())
-        cur.execute(_INDEXES)
+    async with get_cursor(commit=True) as cur:
+        await cur.execute(_PARENT_TABLES)
+        await cur.execute(_hash_partition_ddl())
+        await cur.execute(_month_partition_ddl())
+        await cur.execute(_INDEXES)
 
 
 # --- users ----------------------------------------------------------------
 
-def insertUser(user_id: str, tenant_id: str) -> dict:
+async def insertUser(user_id: str, tenant_id: str) -> dict:
     """Insert a user, or return the existing row if they're already registered."""
-    with get_cursor(commit=True) as cur:
-        cur.execute(
+    async with get_cursor(commit=True) as cur:
+        await cur.execute(
             """
             INSERT INTO users (user_id, tenant_id)
             VALUES (%s, %s)
@@ -150,69 +168,68 @@ def insertUser(user_id: str, tenant_id: str) -> dict:
             """,
             (user_id, tenant_id),
         )
-        row = cur.fetchone()
+        row = await cur.fetchone()
 
-    return row if row is not None else getUserRow(user_id)
+    return row if row is not None else await getUserRow(user_id)
 
 
-def getUserCount() -> int:
+async def getUserCount() -> int:
     """Live user count, cached. Only ever grows, so the bucket range never narrows."""
     global _USER_COUNT, _USER_COUNT_AT
     now = time.monotonic()
     if _USER_COUNT is None or now - _USER_COUNT_AT > _USER_COUNT_TTL:
-        with get_cursor() as cur:
-            cur.execute("SELECT count(*) AS n FROM users")
-            fresh = cur.fetchone()["n"]
+        async with get_cursor() as cur:
+            await cur.execute("SELECT count(*) AS n FROM users")
+            fresh = (await cur.fetchone())["n"]
         _USER_COUNT = max(fresh, _USER_COUNT or 0)
         _USER_COUNT_AT = now
     return _USER_COUNT
 
 
-def getUserRow(user_id: str) -> dict | None:
+async def getUserRow(user_id: str) -> dict | None:
     """Fetch a user row, or None if they don't exist."""
-    with get_cursor() as cur:
-        cur.execute(
+    async with get_cursor() as cur:
+        await cur.execute(
             """
             SELECT user_id, tenant_id, created_at
             FROM users WHERE user_id = %s
             """,
             (user_id,),
         )
-        return cur.fetchone()
+        return await cur.fetchone()
 
 
 # --- chat messages --------------------------------------------------------
 
-def appendMessages(user_id: str, session_id: str, turns: list[dict]) -> None:
-    """Append turns to the durable log, numbering them after the current last seq."""
+async def appendMessages(user_id: str, session_id: str, turns: list[dict]) -> None:
+    """Append turns to the durable log.
+
+    seq is computed inside the INSERT so concurrent writers can't read the same max
+    and collide; the unique index on (user_id, session_id, seq) is the backstop.
+    """
     if not turns:
         return
-    with get_cursor(commit=True) as cur:
-        cur.execute(
-            """
-            SELECT coalesce(max(seq), 0) AS last FROM chat_messages
-            WHERE user_id = %s AND session_id = %s
-            """,
-            (user_id, session_id),
-        )
-        seq = cur.fetchone()["last"]
-        cur.executemany(
+    rows = [(t["role"], t["content"]) for t in turns]
+    async with get_cursor(commit=True) as cur:
+        await cur.execute(
             """
             INSERT INTO chat_messages (user_id, session_id, seq, role, content)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (user_id, session_id, seq) DO NOTHING
+            SELECT %s, %s,
+                   coalesce((SELECT max(seq) FROM chat_messages
+                             WHERE user_id = %s AND session_id = %s), 0)
+                       + row_number() OVER (),
+                   t.role, t.content
+            FROM unnest(%s::text[], %s::text[]) AS t(role, content)
             """,
-            [
-                (user_id, session_id, seq + i, t["role"], t["content"])
-                for i, t in enumerate(turns, start=1)
-            ],
+            (user_id, session_id, user_id, session_id,
+             [r[0] for r in rows], [r[1] for r in rows]),
         )
 
 
-def getRecentMessages(user_id: str, session_id: str, limit: int) -> list[dict]:
+async def getRecentMessages(user_id: str, session_id: str, limit: int) -> list[dict]:
     """Last `limit` turns, oldest first. Used to warm the cache on a miss."""
-    with get_cursor() as cur:
-        cur.execute(
+    async with get_cursor() as cur:
+        await cur.execute(
             """
             SELECT role, content FROM chat_messages
             WHERE user_id = %s AND session_id = %s
@@ -220,15 +237,15 @@ def getRecentMessages(user_id: str, session_id: str, limit: int) -> list[dict]:
             """,
             (user_id, session_id, limit),
         )
-        return list(reversed(cur.fetchall()))
+        return list(reversed(await cur.fetchall()))
 
 
-def getMessagesBefore(user_id: str, session_id: str, before_seq: int | None,
+async def getMessagesBefore(user_id: str, session_id: str, before_seq: int | None,
                       limit: int = 50) -> list[dict]:
     """One page of older turns, newest first. Cursor-paginated on seq, never OFFSET."""
-    with get_cursor() as cur:
+    async with get_cursor() as cur:
         if before_seq is None:
-            cur.execute(
+            await cur.execute(
                 """
                 SELECT seq, role, content FROM chat_messages
                 WHERE user_id = %s AND session_id = %s
@@ -237,7 +254,7 @@ def getMessagesBefore(user_id: str, session_id: str, before_seq: int | None,
                 (user_id, session_id, limit),
             )
         else:
-            cur.execute(
+            await cur.execute(
                 """
                 SELECT seq, role, content FROM chat_messages
                 WHERE user_id = %s AND session_id = %s AND seq < %s
@@ -245,15 +262,15 @@ def getMessagesBefore(user_id: str, session_id: str, before_seq: int | None,
                 """,
                 (user_id, session_id, before_seq, limit),
             )
-        return cur.fetchall()
+        return await cur.fetchall()
 
 
 # --- partition maintenance ------------------------------------------------
 
-def listMonthPartitions() -> list[dict]:
+async def listMonthPartitions() -> list[dict]:
     """Every chat_messages month partition, oldest first."""
-    with get_cursor() as cur:
-        cur.execute(
+    async with get_cursor() as cur:
+        await cur.execute(
             """
             SELECT c.relname AS name,
                    pg_total_relation_size(c.oid) AS bytes
@@ -264,20 +281,18 @@ def listMonthPartitions() -> list[dict]:
             ORDER BY right(c.relname, 7), c.relname
             """
         )
-        return cur.fetchall()
+        return await cur.fetchall()
 
 
-def detachMonthPartitions(before: datetime) -> list[str]:
+async def detachMonthPartitions(before: datetime) -> list[str]:
     """Detach month partitions older than `before`. They survive as standalone tables:
     export, then drop."""
     cutoff = before.strftime("%Y_%m")
-    detached = []
-    with get_cursor(commit=True) as cur:
-        for row in listMonthPartitions():
-            name = row["name"]
-            if name[-7:] >= cutoff:
-                continue
+    # Listed before opening the write cursor: nesting would take a second connection.
+    stale = [r["name"] for r in await listMonthPartitions() if r["name"][-7:] < cutoff]
+
+    async with get_cursor(commit=True) as cur:
+        for name in stale:
             parent = name[:name.rindex("_", 0, name.rindex("_"))]
-            cur.execute(f"ALTER TABLE {parent} DETACH PARTITION {name}")
-            detached.append(name)
-    return detached
+            await cur.execute(f"ALTER TABLE {parent} DETACH PARTITION {name}")
+    return stale

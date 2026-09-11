@@ -39,7 +39,7 @@ async def handleUpload(request: Request):
         if not user_id:
             return JSONResponse({"err": "user_id is required"}, status_code=400)
 
-        tenant_id = await asyncio.to_thread(auth.resolveTenant, user_id)
+        tenant_id = await auth.resolveTenant(user_id)
         if tenant_id is None:
             return JSONResponse({"err": "Unknown user_id"}, status_code=404)
 
@@ -88,7 +88,7 @@ async def handleChat(request: Request):
         if not user_id:
             return JSONResponse({"err": "user_id is required"}, status_code=400)
 
-        tenant_id = await asyncio.to_thread(auth.resolveTenant, user_id)
+        tenant_id = await auth.resolveTenant(user_id)
         if tenant_id is None:
             return JSONResponse({"err": "Unknown user_id"}, status_code=404)
 
@@ -98,7 +98,7 @@ async def handleChat(request: Request):
 
         kb = KnowledgeBase()
 
-        history = await asyncio.to_thread(memory.getHistory, user_id, session_id)
+        history = await memory.getHistory(user_id, session_id)
 
         sysMsg = {
             "role": "system",
@@ -131,7 +131,9 @@ async def handleChat(request: Request):
         llm = ChatOpenAI()
 
         shortHistory = history[-2:] if len(history) >= 2 else history
-        gptResponse, web_img, revelant_link = llm.simpleResponseWithToolCall(
+        # Sync: LLM calls, embedding and the cross-encoder would block the event loop.
+        gptResponse, web_img, revelant_link = await asyncio.to_thread(
+            llm.simpleResponseWithToolCall,
             msg=msg,
             kb=kb,
             activeButton=userMsg.get("activeButton", "document"),
@@ -153,7 +155,7 @@ async def handleChat(request: Request):
             assistant["links"] = revelant_link
 
         # Text only; images and links stay out of the prompt.
-        await asyncio.to_thread(memory.appendTurns, user_id, session_id, [
+        await memory.appendTurns(user_id, session_id, [
             {"role": "user", "content": routingCurrMsg},
             {"role": "assistant", "content": gptResponse.content},
         ])
@@ -170,7 +172,7 @@ async def handleCall(websocket: WebSocket):
     await websocket.accept()
 
     user_id = websocket.query_params.get("user_id", "")
-    tenant_id = await asyncio.to_thread(auth.resolveTenant, user_id) if user_id else None
+    tenant_id = await auth.resolveTenant(user_id) if user_id else None
     if tenant_id is None:
         await websocket.close(code=4004)
         return
@@ -194,7 +196,7 @@ async def createuser(request: Request):
         if not user_id:
             return JSONResponse({"err": "user_id is required"}, status_code=400)
 
-        user = await asyncio.to_thread(auth.createOrLoginUser, user_id)
+        user = await auth.createOrLoginUser(user_id)
 
         return JSONResponse({
             "user_id": user["user_id"],
@@ -216,10 +218,11 @@ routes = [
 
 async def on_startup():
     """Create the partitioned tables and upcoming month partitions if missing."""
-    await asyncio.to_thread(postgres.initSchema)
+    await postgres.initSchema()
 
 
 async def on_shutdown():
+    await postgres.close_pool()
     await asyncio.to_thread(vectorstore.close_client)
     await asyncio.to_thread(memory.close_client)
 
