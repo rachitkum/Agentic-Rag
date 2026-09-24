@@ -1,0 +1,14 @@
+# Keep secrets out of the image -- env comes from compose env_file at runtime.
+.env
+.env.*
+
+# Never let a local cache overwrite the models baked in at build time.
+.cache/
+
+.git/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store

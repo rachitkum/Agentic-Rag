@@ -54,13 +54,50 @@ services:
     volumes:
       - valkey_data:/data
 
+  # The API. No host port: nginx is the only way in, so replicas don't contend for
+  # one. Scale with:  docker compose up -d --scale api=3
+  api:
+    build: .
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+      VALKEY_URL: redis://valkey:6379/0
+      POSTGRES_URL: postgresql://rag:rag@postgres:5432/rag
+    healthcheck:
+      # /ready, not /health: it reports 503 until the models are resident, so compose
+      # does not call a replica healthy while it is still loading them.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:3000/ready').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    depends_on:
+      valkey:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      weaviate:
+        condition: service_started
+
+  # Single entry point; routes across whatever api replicas are running.
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "3000:80"
+    restart: on-failure
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+
   # Ingestion workers. Scale with:  docker compose up -d --scale worker=4
   # No ports: it consumes from the queue rather than serving HTTP.
   worker:
     build: .
-    command: >
-      /bin/bash -c "source .venv/bin/activate &&
-      celery -A src.worker worker --loglevel=info"
+    command: ["/app/.venv/bin/celery", "-A", "src.worker", "worker", "--loglevel=info"]
     restart: on-failure
     env_file:
       - .env

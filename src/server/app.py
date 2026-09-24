@@ -1,3 +1,4 @@
+import os
 import uuid
 import asyncio
 import uvicorn
@@ -231,7 +232,42 @@ async def createuser(request: Request):
         return JSONResponse({"err": "Internal server error"}, status_code=500)
 
 
+# Liveness: is the process up? Deliberately checks nothing external -- a Valkey blip
+# should not make the orchestrator kill an otherwise healthy replica.
+async def handleHealth(request: Request):
+    return JSONResponse({"status": "ok"})
+
+
+# Readiness: should this replica receive traffic yet? The models load at import and
+# take 10-30s on a cold image, so without this the proxy routes to a half-started
+# replica and users get errors.
+async def handleReady(request: Request):
+    checks = {}
+
+    # Importing utils is what blocks on the models; if it returns, they are resident.
+    try:
+        from src.server import utils
+        checks["models"] = utils.model is not None and utils.encoder_model is not None
+    except Exception as e:
+        print("READY: models not loaded:", e)
+        checks["models"] = False
+
+    try:
+        await asyncio.to_thread(memory.get_client().ping)
+        checks["valkey"] = True
+    except Exception as e:
+        print("READY: valkey unreachable:", e)
+        checks["valkey"] = False
+
+    ready = all(checks.values())
+    return JSONResponse(
+        {"ready": ready, "checks": checks}, status_code=200 if ready else 503
+    )
+
+
 routes = [
+    Route("/health", handleHealth, methods=["GET"]),
+    Route("/ready", handleReady, methods=["GET"]),
     Route("/user",createuser,methods=["POST"]),
     Route("/upload", handleUpload, methods=["POST"]),
     Route("/upload/status/{job_id}", handleUploadStatus, methods=["GET"]),
@@ -250,7 +286,11 @@ async def on_shutdown():
     await asyncio.to_thread(memory.close_client)
 
 
-app = Starlette(debug=True, routes=routes,
+# Off by default: debug returns tracebacks -- file paths, locals -- to the caller,
+# which behind a public proxy is an information leak.
+DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+
+app = Starlette(debug=DEBUG, routes=routes,
                 on_startup=[on_startup], on_shutdown=[on_shutdown])
 
 # Add CORS middleware

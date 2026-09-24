@@ -145,13 +145,28 @@ async def ensureMonthPartitions(months_ahead: int = MONTHS_AHEAD) -> None:
         await cur.execute(_month_partition_ddl(months_ahead))
 
 
+# Arbitrary constant; only has to be the same in every replica.
+_SCHEMA_LOCK_ID = 8274531907
+
+
 async def initSchema() -> None:
-    """Create the partitioned tables and their partitions. Safe to re-run on boot."""
+    """Create the partitioned tables and their partitions. Safe to re-run on boot.
+
+    Serialised with an advisory lock: every replica runs this at startup, and with
+    PG_PARTITIONS=64 that is 128 CREATE TABLE statements each. They are IF NOT EXISTS
+    so concurrent runs are safe, but they contend on catalog locks and slow every
+    deploy. The first replica to boot does the work; the rest wait, see the tables
+    already exist, and return.
+    """
     async with get_cursor(commit=True) as cur:
-        await cur.execute(_PARENT_TABLES)
-        await cur.execute(_hash_partition_ddl())
-        await cur.execute(_month_partition_ddl())
-        await cur.execute(_INDEXES)
+        await cur.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_LOCK_ID,))
+        try:
+            await cur.execute(_PARENT_TABLES)
+            await cur.execute(_hash_partition_ddl())
+            await cur.execute(_month_partition_ddl())
+            await cur.execute(_INDEXES)
+        finally:
+            await cur.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK_ID,))
 
 
 # --- users ----------------------------------------------------------------
