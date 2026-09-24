@@ -13,6 +13,7 @@ Run Weaviate on Docker; connect via env:
 """
 
 import os
+import threading
 from dotenv import load_dotenv
 import weaviate
 from weaviate.classes.init import Auth
@@ -27,6 +28,12 @@ WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY", "")
 COLLECTION_NAME = "RagNode"
 
 _CLIENT = None
+
+# get_client() runs in threadpool workers (KB.py and ingest.py are both reached via
+# asyncio.to_thread), so the reconnect must be serialised: without it every thread
+# that sees a dead client builds its own, and all but the last are orphaned with
+# their sockets still open.
+_CLIENT_LOCK = threading.Lock()
 
 
 def _connect():
@@ -77,20 +84,40 @@ def ensure_schema(client) -> None:
 
 
 def get_client():
-    """Return the shared client, connecting on first use. Do not close it."""
+    """Return the shared client, connecting on first use. Do not close it.
+
+    Double-checked: the healthy path takes no lock, and the re-check inside the lock
+    means threads that queued up behind a reconnect find a live client and reuse it
+    rather than each building their own.
+    """
     global _CLIENT
-    if _CLIENT is None or not _CLIENT.is_connected():
-        _CLIENT = _connect()
-        ensure_schema(_CLIENT)
-    return _CLIENT
+    if _CLIENT is not None and _CLIENT.is_connected():
+        return _CLIENT
+
+    with _CLIENT_LOCK:
+        if _CLIENT is None or not _CLIENT.is_connected():
+            stale = _CLIENT
+            _CLIENT = _connect()
+            ensure_schema(_CLIENT)
+            # Replacing it without closing leaks the socket on every reconnect.
+            if stale is not None:
+                try:
+                    stale.close()
+                except Exception as e:
+                    print("ERROR closing stale weaviate client:", e)
+        return _CLIENT
 
 
 def close_client() -> None:
-    """Close the shared client (called on app shutdown)."""
+    """Close the shared client (called on app shutdown).
+
+    Takes the same lock as get_client() so shutdown can't race a reconnect in flight.
+    """
     global _CLIENT
-    if _CLIENT is not None:
-        _CLIENT.close()
-        _CLIENT = None
+    with _CLIENT_LOCK:
+        if _CLIENT is not None:
+            _CLIENT.close()
+            _CLIENT = None
 
 
 def _tenant(client, tenant_id: str):

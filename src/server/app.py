@@ -22,8 +22,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "Answer using the retrieved context when available and be honest when you don't know."
 )
 
-# job_id -> {status, result/error}. Single-process only; move to Valkey to scale out.
-UPLOAD_JOBS: dict[str, dict] = {}
+# Job status lives in Valkey (src/db/memory.py), not in-process, so a status poll
+# load-balanced to any replica can see a job started on another.
 
 
 # Chunk + RAPTOR build + store runs in the background; client polls /upload/status.
@@ -48,7 +48,14 @@ async def handleUpload(request: Request):
 
         doc_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
-        UPLOAD_JOBS[job_id] = {"status": "processing"}
+
+        # Claim the job before starting work: if this fails the client would have no
+        # way to ever see the outcome, so fail the upload instead of ingesting blind.
+        try:
+            await asyncio.to_thread(memory.setJobProcessing, job_id)
+        except Exception as e:
+            print("ERROR recording upload job:", e)
+            return JSONResponse({"err": "Job store unavailable"}, status_code=503)
 
         async def run_job():
             try:
@@ -56,10 +63,14 @@ async def handleUpload(request: Request):
                 result = await asyncio.to_thread(
                     ingest_pdf, pdf_bytes, user_id, tenant_id, doc_id, session_id, file_name
                 )
-                UPLOAD_JOBS[job_id] = {"status": "done", "result": result}
+                await asyncio.to_thread(memory.setJobDone, job_id, result)
             except Exception as e:
                 print("ERROR during ingestion job:", e)
-                UPLOAD_JOBS[job_id] = {"status": "error", "error": str(e)}
+                try:
+                    await asyncio.to_thread(memory.setJobError, job_id, str(e))
+                except Exception as e2:
+                    # Nothing left to tell the client with; it will poll until the TTL.
+                    print("ERROR recording job failure:", e2)
 
         asyncio.create_task(run_job())
 
@@ -72,7 +83,13 @@ async def handleUpload(request: Request):
 # Poll the status of an ingestion job.
 async def handleUploadStatus(request: Request):
     job_id = request.path_params["job_id"]
-    job = UPLOAD_JOBS.get(job_id)
+    try:
+        job = await asyncio.to_thread(memory.getJob, job_id)
+    except Exception as e:
+        print("ERROR reading upload job:", e)
+        return JSONResponse({"err": "Job store unavailable"}, status_code=503)
+
+    # Also what an expired job looks like once JOB_TTL_SECONDS has passed.
     if job is None:
         return JSONResponse({"err": "Unknown job_id"}, status_code=404)
     return JSONResponse(job)
