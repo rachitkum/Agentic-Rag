@@ -124,6 +124,21 @@ def _tenant(client, tenant_id: str):
     return client.collections.get(COLLECTION_NAME).with_tenant(tenant_id)
 
 
+def delete_doc_nodes(client, tenant_id: str, user_id: str, doc_id: str) -> None:
+    """Remove every node previously stored for this document.
+
+    Ingestion is retried on failure and a task can be redelivered after a worker dies
+    mid-insert, so inserting without clearing first would leave two copies of the same
+    document and return duplicate chunks from search. doc_id is a server-generated
+    uuid4 per upload, so this can only ever match this document's own nodes.
+    """
+    collection = _tenant(client, tenant_id)
+    collection.data.delete_many(
+        where=Filter.by_property("user_id").equal(user_id)
+        & Filter.by_property("doc_id").equal(doc_id)
+    )
+
+
 def insert_nodes(client, nodes: list[dict], tenant_id: str, user_id: str,
                  doc_id: str, session_id: str = "") -> int:
     """Batch-insert one document's RAPTOR nodes into its owner's tenant."""

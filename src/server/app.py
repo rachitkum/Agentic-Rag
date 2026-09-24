@@ -14,8 +14,8 @@ from src.server.KB import KnowledgeBase
 from src.server.prompt import INSTRUCTIONS
 from src.server.tools import build_tools
 from src.server.voice import OpenAIVoiceReactAgent
-from src.server.ingest import ingest_pdf
-from src.db import auth, memory, postgres, vectorstore
+from src.worker import ingest_pdf_task
+from src.db import auth, memory, postgres, storage, vectorstore
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are rag-agent, a helpful study and research assistant. "
@@ -49,30 +49,36 @@ async def handleUpload(request: Request):
         doc_id = str(uuid.uuid4())
         job_id = str(uuid.uuid4())
 
+        # The bytes go to S3 rather than staying resident for the length of the
+        # ingest, and the worker fetches them by key.
+        s3_key = storage.pdf_key(user_id, doc_id)
+        try:
+            await asyncio.to_thread(storage.put_pdf, s3_key, pdf_bytes)
+        except Exception as e:
+            print("ERROR storing upload:", e)
+            return JSONResponse({"err": "Storage unavailable"}, status_code=503)
+
         # Claim the job before starting work: if this fails the client would have no
         # way to ever see the outcome, so fail the upload instead of ingesting blind.
         try:
             await asyncio.to_thread(memory.setJobProcessing, job_id)
         except Exception as e:
             print("ERROR recording upload job:", e)
+            await asyncio.to_thread(storage.delete_pdf, s3_key)
             return JSONResponse({"err": "Job store unavailable"}, status_code=503)
 
-        async def run_job():
-            try:
-                # Tree-building calls the LLM per cluster; keep it off the event loop.
-                result = await asyncio.to_thread(
-                    ingest_pdf, pdf_bytes, user_id, tenant_id, doc_id, session_id, file_name
-                )
-                await asyncio.to_thread(memory.setJobDone, job_id, result)
-            except Exception as e:
-                print("ERROR during ingestion job:", e)
-                try:
-                    await asyncio.to_thread(memory.setJobError, job_id, str(e))
-                except Exception as e2:
-                    # Nothing left to tell the client with; it will poll until the TTL.
-                    print("ERROR recording job failure:", e2)
-
-        asyncio.create_task(run_job())
+        # Hand off to a worker instead of ingesting here: a RAPTOR build would other-
+        # wise compete with chat for this process's threadpool and die with it.
+        try:
+            await asyncio.to_thread(
+                ingest_pdf_task.delay,
+                job_id, s3_key, user_id, tenant_id, doc_id, session_id, file_name,
+            )
+        except Exception as e:
+            print("ERROR enqueueing ingestion job:", e)
+            await asyncio.to_thread(memory.setJobError, job_id, "Could not queue ingestion")
+            await asyncio.to_thread(storage.delete_pdf, s3_key)
+            return JSONResponse({"err": "Queue unavailable"}, status_code=503)
 
         return JSONResponse({"job_id": job_id, "doc_id": doc_id, "status": "processing"})
     except Exception as e:

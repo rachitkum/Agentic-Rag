@@ -18,7 +18,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.server.utils import getEmbeddings
 from src.server.LLM import ChatOpenAI
 from src.server.raptor import build_raptor_tree
-from src.db import vectorstore
+from src.db import storage, vectorstore
 
 
 def chunk_pdf_bytes(pdf_bytes: bytes) -> list[str]:
@@ -59,9 +59,26 @@ def ingest_pdf(pdf_bytes: bytes, user_id: str, tenant_id: str, doc_id: str,
         node["file_name"] = file_name
 
     client = vectorstore.get_client()
+    # Clear first so a retried or redelivered ingest replaces this document's nodes
+    # rather than adding a second copy. No-op on the first attempt.
+    vectorstore.delete_doc_nodes(client, tenant_id, user_id, doc_id)
     vectorstore.insert_nodes(client, nodes, tenant_id, user_id, doc_id, session_id)
 
     leaves = sum(1 for n in nodes if n["node_type"] == "leaf")
     summaries = len(nodes) - leaves
     print(f"Ingested '{file_name}' for {user_id} in {tenant_id}: {len(nodes)} nodes ({leaves} leaves, {summaries} summaries)")
     return {"chunks": len(chunks), "nodes": len(nodes), "leaves": leaves, "summaries": summaries}
+
+
+def ingest_from_s3(s3_key: str, user_id: str, tenant_id: str, doc_id: str,
+                   session_id: str = "", file_name: str = "") -> dict:
+    """Fetch an upload from object storage and ingest it.
+
+    The entry point for out-of-process ingestion: the caller only carries the key, so
+    the PDF itself never travels through the queue. Leaves the object in place on
+    failure so a retry can re-read it.
+    """
+    pdf_bytes = storage.get_pdf(s3_key)
+    result = ingest_pdf(pdf_bytes, user_id, tenant_id, doc_id, session_id, file_name)
+    storage.delete_pdf(s3_key)
+    return result

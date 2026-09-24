@@ -54,6 +54,29 @@ services:
     volumes:
       - valkey_data:/data
 
+  # Ingestion workers. Scale with:  docker compose up -d --scale worker=4
+  # No ports: it consumes from the queue rather than serving HTTP.
+  worker:
+    build: .
+    command: >
+      /bin/bash -c "source .venv/bin/activate &&
+      celery -A src.worker worker --loglevel=info"
+    restart: on-failure
+    env_file:
+      - .env
+    environment:
+      # Service names, not localhost: these resolve on the compose network.
+      WEAVIATE_URL: http://weaviate:8080
+      VALKEY_URL: redis://valkey:6379/0
+      POSTGRES_URL: postgresql://rag:rag@postgres:5432/rag
+    depends_on:
+      valkey:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      weaviate:
+        condition: service_started
+
 volumes:
   weaviate_data:
   postgres_data:
